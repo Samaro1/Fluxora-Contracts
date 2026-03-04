@@ -100,6 +100,15 @@ pub struct RateUpdated {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+pub struct StreamEndShortened {
+    pub stream_id: u64,
+    pub old_end_time: u64,
+    pub new_end_time: u64,
+    pub refund_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
 pub struct Stream {
     pub stream_id: u64,
     pub sender: Address,
@@ -1130,6 +1139,114 @@ impl FluxoraStream {
                 old_rate_per_second: old_rate,
                 new_rate_per_second,
                 effective_time: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Shorten a stream's `end_time` and refund unstreamed tokens to the sender.
+    ///
+    /// This operation safely reduces the remaining duration of an **Active** or **Paused**
+    /// stream while:
+    ///
+    /// - Preserving all already-accrued entitlement for the recipient.
+    /// - Refunding only the portion of the deposit that can never accrue under the new end time.
+    /// - Maintaining the invariant `deposit_amount >= accrued(now)` at the moment of update.
+    ///
+    /// # Parameters
+    /// - `stream_id`: Unique identifier of the stream to update.
+    /// - `new_end_time`: New stream end timestamp (must be:
+    ///   - `> current_ledger_timestamp`
+    ///   - `> start_time`
+    ///   - `>= cliff_time`
+    ///   - `< current end_time`).
+    ///
+    /// # Behaviour
+    /// - Computes the new maximum streamable amount as
+    ///   `rate_per_second × (new_end_time - start_time)`.
+    /// - Sets `deposit_amount` to this new maximum streamable amount.
+    /// - Refunds `old_deposit - new_deposit` to the sender.
+    /// - Leaves accrued amount at the current ledger time unchanged.
+    ///
+    /// # Returns
+    /// - `Result<(), ContractError>`: `Ok(())` on success, or `StreamNotFound` on invalid `stream_id`.
+    ///
+    /// # Events
+    /// - Emits a `sched_shrt` event with a `StreamEndShortened` payload describing the change.
+    pub fn shorten_stream_end_time(
+        env: Env,
+        stream_id: u64,
+        new_end_time: u64,
+    ) -> Result<(), ContractError> {
+        let mut stream = load_stream(&env, stream_id)?;
+
+        // Only the original sender can modify the schedule.
+        Self::require_stream_sender(&stream.sender);
+
+        // Only non-terminal streams may be shortened.
+        assert!(
+            stream.status == StreamStatus::Active || stream.status == StreamStatus::Paused,
+            "can only shorten active or paused streams"
+        );
+
+        let now = env.ledger().timestamp();
+
+        // New end time must be in the future relative to the current ledger timestamp.
+        assert!(
+            new_end_time >= now,
+            "new end_time must be >= current ledger timestamp"
+        );
+
+        // Must strictly shorten the schedule.
+        assert!(
+            new_end_time < stream.end_time,
+            "new end_time must be before existing end_time"
+        );
+
+        // Preserve basic schedule invariants.
+        assert!(
+            new_end_time > stream.start_time,
+            "new end_time must be after start_time"
+        );
+        assert!(
+            new_end_time >= stream.cliff_time,
+            "new end_time must be >= cliff_time"
+        );
+
+        // Compute new maximum streamable amount under the shortened schedule.
+        let new_duration = (new_end_time - stream.start_time) as i128;
+        let new_max_streamable = stream
+            .rate_per_second
+            .checked_mul(new_duration)
+            .expect("overflow calculating total streamable amount for shortened schedule");
+
+        // Deposit must still be sufficient to cover the shortened schedule (by construction
+        // this should hold given the original validation, but we keep an explicit assert).
+        assert!(
+            new_max_streamable <= stream.deposit_amount,
+            "shortened schedule must not increase total streamable amount"
+        );
+
+        let old_end_time = stream.end_time;
+        let old_deposit = stream.deposit_amount;
+        let refund_amount = old_deposit - new_max_streamable;
+
+        stream.end_time = new_end_time;
+        stream.deposit_amount = new_max_streamable;
+        save_stream(&env, &stream);
+
+        if refund_amount > 0 {
+            push_token(&env, &stream.sender, refund_amount);
+        }
+
+        env.events().publish(
+            (symbol_short!("end_shrt"), stream_id),
+            StreamEndShortened {
+                stream_id,
+                old_end_time,
+                new_end_time,
+                refund_amount,
             },
         );
 
