@@ -8,8 +8,8 @@ use soroban_sdk::{
 };
 
 use crate::{
-    ContractError, CreateStreamParams, FluxoraStream, FluxoraStreamClient, StreamEvent,
-    StreamStatus,
+    ContractError, CreateStreamParams, FluxoraStream, FluxoraStreamClient, StreamCreated,
+    StreamEvent, StreamStatus, WithdrawalTo,
 };
 
 // ---------------------------------------------------------------------------
@@ -80,12 +80,23 @@ impl<'a> TestContext<'a> {
         let recipient = Address::generate(&env);
 
         let client = FluxoraStreamClient::new(&env, &contract_id);
+
+        // init requires bootstrap admin authorization in strict mode.
+        use soroban_sdk::{testutils::MockAuth, testutils::MockAuthInvoke, IntoVal};
+        env.mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "init",
+                args: (&token_id, &admin).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
         client.init(&token_id, &admin);
 
         let sac = StellarAssetClient::new(&env, &token_id);
 
         // Mock the minting auth since mock_all_auths is not enabled.
-        use soroban_sdk::{testutils::MockAuth, testutils::MockAuthInvoke, IntoVal};
         env.mock_auths(&[MockAuth {
             address: &token_admin,
             invoke: &MockAuthInvoke {
@@ -178,6 +189,7 @@ impl<'a> TestContext<'a> {
 #[test]
 fn test_init_stores_token_and_admin() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, FluxoraStream);
     let client = FluxoraStreamClient::new(&env, &contract_id);
 
@@ -192,9 +204,77 @@ fn test_init_stores_token_and_admin() {
 }
 
 #[test]
+fn test_init_requires_admin_authorization_in_strict_mode() {
+    let env = Env::default();
+
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let token_id = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    env.mock_auths(&[MockAuth {
+        address: &admin,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "init",
+            args: (&token_id, &admin).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    client.init(&token_id, &admin);
+
+    let cfg = client.get_config();
+    assert_eq!(cfg.token, token_id);
+    assert_eq!(cfg.admin, admin);
+}
+
+#[test]
+fn test_init_rejects_wrong_signer_and_has_no_side_effects() {
+    let env = Env::default();
+
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let token_id = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    env.mock_auths(&[MockAuth {
+        address: &attacker,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "init",
+            args: (&token_id, &admin).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.init(&token_id, &admin);
+    }));
+    assert!(result.is_err(), "init must reject non-admin signer");
+
+    // Bootstrap state must remain unset after failed auth.
+    let cfg_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.get_config();
+    }));
+    assert!(
+        cfg_result.is_err(),
+        "failed init auth must not write config into storage"
+    );
+    assert_eq!(
+        client.get_stream_count(),
+        0,
+        "failed init auth must not initialize stream counter"
+    );
+}
+
+#[test]
 #[should_panic(expected = "already initialised")]
 fn test_init_second_call_fails() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, FluxoraStream);
     let client = FluxoraStreamClient::new(&env, &contract_id);
 
@@ -7436,7 +7516,6 @@ fn test_create_streams_batch_success() {
 }
 
 #[test]
-#[should_panic(expected = "deposit_amount must cover total streamable amount")]
 fn test_create_streams_batch_atomic_failure() {
     let ctx = TestContext::setup();
     ctx.env.ledger().set_timestamp(0);
@@ -7461,10 +7540,36 @@ fn test_create_streams_batch_atomic_failure() {
     };
 
     let streams = vec![&ctx.env, valid_params, invalid_params];
+    let stream_count_before = ctx.client().get_stream_count();
+    let sender_balance_before = ctx.token().balance(&ctx.sender);
+    let contract_balance_before = ctx.token().balance(&ctx.contract_id);
+    let events_before = ctx.env.events().all().len();
 
-    // This should panic due to the invalid parameter in the second stream.
-    // Because Soroban state changes revert on panic, the first stream won't be saved.
-    ctx.client().create_streams(&ctx.sender, &streams);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.client().create_streams(&ctx.sender, &streams);
+    }));
+    assert!(result.is_err(), "batch with one invalid stream must fail");
+
+    assert_eq!(
+        ctx.client().get_stream_count(),
+        stream_count_before,
+        "batch failure must not advance stream counter"
+    );
+    assert_eq!(
+        ctx.token().balance(&ctx.sender),
+        sender_balance_before,
+        "sender balance must not change on batch validation failure"
+    );
+    assert_eq!(
+        ctx.token().balance(&ctx.contract_id),
+        contract_balance_before,
+        "contract balance must not change on batch validation failure"
+    );
+    assert_eq!(
+        ctx.env.events().all().len(),
+        events_before,
+        "failed batch must emit no created events"
+    );
 }
 
 #[test]
@@ -7596,6 +7701,163 @@ fn test_create_streams_batch_strict_auth() {
 
     let stream_ids = ctx.client().create_streams(&ctx.sender, &streams);
     assert_eq!(stream_ids.len(), 2);
+}
+
+#[test]
+fn test_create_streams_batch_emits_created_events_with_payloads() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let params1 = CreateStreamParams {
+        recipient: Address::generate(&ctx.env),
+        deposit_amount: 1111,
+        rate_per_second: 1,
+        start_time: 0,
+        cliff_time: 0,
+        end_time: 1111,
+    };
+    let params2 = CreateStreamParams {
+        recipient: Address::generate(&ctx.env),
+        deposit_amount: 2222,
+        rate_per_second: 2,
+        start_time: 10,
+        cliff_time: 10,
+        end_time: 1121,
+    };
+    let streams = vec![&ctx.env, params1.clone(), params2.clone()];
+    let events_before = ctx.env.events().all().len();
+
+    let ids = ctx.client().create_streams(&ctx.sender, &streams);
+    assert_eq!(ids.len(), 2);
+
+    let events = ctx.env.events().all();
+    let mut created_payloads: std::vec::Vec<StreamCreated> = std::vec::Vec::new();
+    for i in events_before..events.len() {
+        let event = events.get(i).unwrap();
+        let topic0 = Symbol::from_val(&ctx.env, &event.1.get(0).unwrap());
+        if topic0 == Symbol::new(&ctx.env, "created") {
+            created_payloads.push(StreamCreated::try_from_val(&ctx.env, &event.2).unwrap());
+        }
+    }
+    assert_eq!(
+        created_payloads.len(),
+        2,
+        "batch success must emit one created event per stream"
+    );
+
+    let payload1 = created_payloads[0].clone();
+    let payload2 = created_payloads[1].clone();
+
+    assert_eq!(payload1.stream_id, ids.get(0).unwrap());
+    assert_eq!(payload1.sender, ctx.sender);
+    assert_eq!(payload1.recipient, params1.recipient);
+    assert_eq!(payload1.deposit_amount, params1.deposit_amount);
+
+    assert_eq!(payload2.stream_id, ids.get(1).unwrap());
+    assert_eq!(payload2.sender, ctx.sender);
+    assert_eq!(payload2.recipient, params2.recipient);
+    assert_eq!(payload2.deposit_amount, params2.deposit_amount);
+}
+
+#[test]
+fn test_create_streams_batch_total_deposit_overflow_has_no_side_effects() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let params1 = CreateStreamParams {
+        recipient: Address::generate(&ctx.env),
+        deposit_amount: i128::MAX,
+        rate_per_second: i128::MAX,
+        start_time: 0,
+        cliff_time: 0,
+        end_time: 1,
+    };
+    let params2 = CreateStreamParams {
+        recipient: Address::generate(&ctx.env),
+        deposit_amount: 1,
+        rate_per_second: 1,
+        start_time: 0,
+        cliff_time: 0,
+        end_time: 1,
+    };
+    let streams = vec![&ctx.env, params1, params2];
+
+    let stream_count_before = ctx.client().get_stream_count();
+    let sender_balance_before = ctx.token().balance(&ctx.sender);
+    let contract_balance_before = ctx.token().balance(&ctx.contract_id);
+    let events_before = ctx.env.events().all().len();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.client().create_streams(&ctx.sender, &streams);
+    }));
+    assert!(
+        result.is_err(),
+        "overflow in total batch deposit must abort the whole call"
+    );
+    assert_eq!(
+        ctx.client().get_stream_count(),
+        stream_count_before,
+        "failed overflow batch must not advance stream counter"
+    );
+    assert_eq!(
+        ctx.token().balance(&ctx.sender),
+        sender_balance_before,
+        "failed overflow batch must not move sender funds"
+    );
+    assert_eq!(
+        ctx.token().balance(&ctx.contract_id),
+        contract_balance_before,
+        "failed overflow batch must not change contract funds"
+    );
+    assert_eq!(
+        ctx.env.events().all().len(),
+        events_before,
+        "failed overflow batch must emit no events"
+    );
+}
+
+#[test]
+fn test_create_streams_batch_wrong_auth_fails_without_side_effects() {
+    let ctx = TestContext::setup_strict();
+    ctx.env.ledger().set_timestamp(0);
+    let attacker = Address::generate(&ctx.env);
+
+    let params = CreateStreamParams {
+        recipient: Address::generate(&ctx.env),
+        deposit_amount: 1000,
+        rate_per_second: 1,
+        start_time: 0,
+        cliff_time: 0,
+        end_time: 1000,
+    };
+    let streams = vec![&ctx.env, params.clone()];
+    let stream_count_before = ctx.client().get_stream_count();
+    let sender_balance_before = ctx.token().balance(&ctx.sender);
+    let contract_balance_before = ctx.token().balance(&ctx.contract_id);
+    let events_before = ctx.env.events().all().len();
+
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    ctx.env.mock_auths(&[MockAuth {
+        address: &attacker,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "create_streams",
+            args: (&ctx.sender, streams.clone()).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.client().create_streams(&ctx.sender, &streams);
+    }));
+    assert!(result.is_err(), "non-sender auth must be rejected");
+    assert_eq!(ctx.client().get_stream_count(), stream_count_before);
+    assert_eq!(ctx.token().balance(&ctx.sender), sender_balance_before);
+    assert_eq!(
+        ctx.token().balance(&ctx.contract_id),
+        contract_balance_before
+    );
+    assert_eq!(ctx.env.events().all().len(), events_before);
 }
 
 // ---------------------------------------------------------------------------
@@ -8822,6 +9084,247 @@ fn test_recipient_stream_index_multiple_senders() {
 }
 
 // ---------------------------------------------------------------------------
+// Tests — withdraw_to: destination constraints and event parity (#265)
+// ---------------------------------------------------------------------------
+
+/// WithdrawalTo event is emitted with the correct payload (stream_id, recipient,
+/// destination, amount). Indexers rely on this exact shape.
+#[test]
+fn test_withdraw_to_emits_withdrawal_to_event() {
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::{symbol_short, IntoVal};
+
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+    let destination = Address::generate(&ctx.env);
+
+    ctx.env.ledger().set_timestamp(600);
+    let amount = ctx.client().withdraw_to(&stream_id, &destination);
+    assert_eq!(amount, 600);
+
+    let events = ctx.env.events().all();
+    let wdraw_event = events.iter().find(|(_, topics, _)| {
+        topics
+            == &soroban_sdk::vec![
+                &ctx.env,
+                symbol_short!("wdraw_to").into_val(&ctx.env),
+                stream_id.into_val(&ctx.env),
+            ]
+    });
+    assert!(wdraw_event.is_some(), "wdraw_to event must be emitted");
+
+    let (_, _, data) = wdraw_event.unwrap();
+    let payload = WithdrawalTo::try_from_val(&ctx.env, &data)
+        .expect("event data must deserialize as WithdrawalTo");
+    assert_eq!(payload.stream_id, stream_id);
+    assert_eq!(payload.recipient, ctx.recipient);
+    assert_eq!(payload.destination, destination);
+    assert_eq!(payload.amount, 600);
+}
+
+/// When withdraw_to drains the stream, a StreamCompleted event must follow the
+/// WithdrawalTo event in the same transaction — same parity as withdraw().
+#[test]
+fn test_withdraw_to_emits_completed_event_on_full_drain() {
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::{symbol_short, IntoVal};
+
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+    let destination = Address::generate(&ctx.env);
+
+    ctx.env.ledger().set_timestamp(1000);
+    let amount = ctx.client().withdraw_to(&stream_id, &destination);
+    assert_eq!(amount, 1000);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Completed);
+
+    let events = ctx.env.events().all();
+    let completed_event = events.iter().find(|(_, topics, _)| {
+        topics
+            == &soroban_sdk::vec![
+                &ctx.env,
+                symbol_short!("completed").into_val(&ctx.env),
+                stream_id.into_val(&ctx.env),
+            ]
+    });
+    assert!(
+        completed_event.is_some(),
+        "completed event must be emitted when withdraw_to drains the stream"
+    );
+}
+
+/// No event is emitted when withdraw_to returns 0 (before cliff / nothing accrued).
+/// This matches the zero-withdrawable behavior of withdraw().
+#[test]
+fn test_withdraw_to_no_event_when_zero() {
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::{symbol_short, IntoVal};
+
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_cliff_stream(); // cliff at 500
+    let destination = Address::generate(&ctx.env);
+
+    ctx.env.ledger().set_timestamp(100); // before cliff
+    let amount = ctx.client().withdraw_to(&stream_id, &destination);
+    assert_eq!(amount, 0);
+
+    let events = ctx.env.events().all();
+    let wdraw_event = events.iter().find(|(_, topics, _)| {
+        topics
+            == &soroban_sdk::vec![
+                &ctx.env,
+                symbol_short!("wdraw_to").into_val(&ctx.env),
+                stream_id.into_val(&ctx.env),
+            ]
+    });
+    assert!(
+        wdraw_event.is_none(),
+        "wdraw_to event must NOT be emitted when withdrawable is 0"
+    );
+}
+
+/// destination == recipient is explicitly allowed (self-redirect).
+/// Tokens land at the recipient address; state is updated correctly.
+#[test]
+fn test_withdraw_to_destination_equals_recipient_is_allowed() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(500);
+    let amount = ctx.client().withdraw_to(&stream_id, &ctx.recipient);
+
+    assert_eq!(amount, 500);
+    assert_eq!(ctx.token().balance(&ctx.recipient), 500);
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.withdrawn_amount, 500);
+}
+
+/// withdraw_to on a cancelled stream delivers the accrued-but-not-withdrawn amount
+/// to the destination, matching the behaviour of withdraw() on cancelled streams.
+#[test]
+fn test_withdraw_to_on_cancelled_stream_delivers_accrued() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+    let destination = Address::generate(&ctx.env);
+
+    // Cancel at t=400: 400 tokens accrued, 600 refunded to sender
+    ctx.env.ledger().set_timestamp(400);
+    ctx.client().cancel_stream(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Cancelled);
+    assert_eq!(state.withdrawn_amount, 0);
+
+    // Recipient redirects their accrued share to a cold wallet
+    let amount = ctx.client().withdraw_to(&stream_id, &destination);
+
+    assert_eq!(
+        amount, 400,
+        "accrued amount must be delivered to destination"
+    );
+    assert_eq!(ctx.token().balance(&destination), 400);
+    assert_eq!(ctx.token().balance(&ctx.recipient), 0);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.withdrawn_amount, 400);
+}
+
+/// withdraw_to on a cancelled stream emits the WithdrawalTo event with the correct payload.
+#[test]
+fn test_withdraw_to_on_cancelled_stream_emits_event() {
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::{symbol_short, IntoVal};
+
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+    let destination = Address::generate(&ctx.env);
+
+    ctx.env.ledger().set_timestamp(300);
+    ctx.client().cancel_stream(&stream_id);
+
+    let amount = ctx.client().withdraw_to(&stream_id, &destination);
+    assert_eq!(amount, 300);
+
+    let events = ctx.env.events().all();
+    let wdraw_event = events.iter().find(|(_, topics, _)| {
+        topics
+            == &soroban_sdk::vec![
+                &ctx.env,
+                symbol_short!("wdraw_to").into_val(&ctx.env),
+                stream_id.into_val(&ctx.env),
+            ]
+    });
+    assert!(
+        wdraw_event.is_some(),
+        "wdraw_to event must be emitted for cancelled stream withdrawal"
+    );
+    let (_, _, data) = wdraw_event.unwrap();
+    let payload = WithdrawalTo::try_from_val(&ctx.env, &data).unwrap();
+    assert_eq!(payload.amount, 300);
+    assert_eq!(payload.destination, destination);
+}
+
+/// withdraw_to panics on a completed stream — same guard as withdraw().
+#[test]
+#[should_panic(expected = "stream already completed")]
+fn test_withdraw_to_panics_on_completed_stream() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+    let destination = Address::generate(&ctx.env);
+
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&stream_id);
+
+    ctx.client().withdraw_to(&stream_id, &destination);
+}
+
+/// withdraw_to panics on a paused stream — same guard as withdraw().
+#[test]
+#[should_panic(expected = "cannot withdraw from paused stream")]
+fn test_withdraw_to_panics_on_paused_stream() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+    let destination = Address::generate(&ctx.env);
+
+    ctx.env.ledger().set_timestamp(200);
+    ctx.client().pause_stream(&stream_id);
+
+    ctx.client().withdraw_to(&stream_id, &destination);
+}
+
+/// Interleaving withdraw and withdraw_to on the same stream never double-pays.
+/// withdrawn_amount is the single source of truth for both paths.
+#[test]
+fn test_withdraw_and_withdraw_to_interleaved_no_double_pay() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+    let destination = Address::generate(&ctx.env);
+
+    // t=200: withdraw normally → recipient gets 200
+    ctx.env.ledger().set_timestamp(200);
+    let a1 = ctx.client().withdraw(&stream_id);
+    assert_eq!(a1, 200);
+
+    // t=500: withdraw_to → destination gets 300 (500 - 200 already withdrawn)
+    ctx.env.ledger().set_timestamp(500);
+    let a2 = ctx.client().withdraw_to(&stream_id, &destination);
+    assert_eq!(a2, 300);
+
+    // t=1000: withdraw_to again → destination gets remaining 500
+    ctx.env.ledger().set_timestamp(1000);
+    let a3 = ctx.client().withdraw_to(&stream_id, &destination);
+    assert_eq!(a3, 500);
+
+    assert_eq!(ctx.token().balance(&ctx.recipient), 200);
+    assert_eq!(ctx.token().balance(&destination), 800);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.withdrawn_amount, 1000);
+    assert_eq!(state.status, StreamStatus::Completed);
+}
+
 // Tests — Issue #252: create_stream deposit, rate, and schedule validation matrix
 // ---------------------------------------------------------------------------
 

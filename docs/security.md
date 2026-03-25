@@ -7,7 +7,11 @@ Notes for auditors and maintainers on security-relevant patterns used in the Flu
 The contract follows the **Checks-Effects-Interactions** pattern to reduce reentrancy risk.
 State updates are performed **before** any external token transfers in all functions that move funds.
 
-### `withdraw`
+- **`create_streams`**  
+  The contract requires sender auth once, validates every batch entry first, and computes the total deposit with checked arithmetic before any token transfer. It then performs one pull transfer for the total and persists streams. If any validation/overflow/transfer step fails, Soroban reverts the transaction: no streams are stored and no creation events remain on-chain.
+
+- **`withdraw`**  
+  After all checks (auth, status, withdrawable amount), the contract updates `withdrawn_amount` and, when applicable, sets status to `Completed`, then persists the stream with `save_stream`. Only after that does it call the token contract to transfer tokens to the recipient.
 
 After all checks (auth, status, withdrawable amount), the contract:
 1. Updates `withdrawn_amount` in the stream struct.
@@ -113,6 +117,10 @@ instance storage under `DataKey::GlobalPaused`.
 
 ## Re-initialization prevention
 
-`init` checks for the presence of `DataKey::Config` in instance storage and panics
-with `"already initialised"` if called a second time. This prevents an attacker from
-repointing the contract to a different token address or replacing the admin after deployment.
+`init` is bootstrap-authenticated and one-shot:
+
+- It requires `admin.require_auth()` from the declared bootstrap admin.
+- It checks `DataKey::Config` and panics with `"already initialised"` on any second call.
+
+This prevents unauthorized bootstrap and prevents later repointing to a different token
+address or replacing the admin through `init`.

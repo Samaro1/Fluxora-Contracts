@@ -222,8 +222,9 @@ If the existing deposit does not cover the extended duration, `extend_stream_end
 
 | Function                 | Authorized Caller | Auth Check                 |
 | ------------------------ | ----------------- | -------------------------- |
-| `init`                   | Deployer (once)   | None                       |
+| `init`                   | Bootstrap admin signer (once) | `admin.require_auth()` |
 | `create_stream`          | Sender            | `sender.require_auth()`    |
+| `create_streams`         | Sender            | `sender.require_auth()` (once per batch) |
 | `pause_stream`           | Sender            | `sender.require_auth()`    |
 | `resume_stream`          | Sender            | `sender.require_auth()`    |
 | `cancel_stream`          | Sender            | `sender.require_auth()`    |
@@ -251,6 +252,30 @@ If the existing deposit does not cover the extended duration, `extend_stream_end
 `batch_withdraw` processes each stream ID in order. A stream with status `Completed` **does not panic** — it contributes a zero-amount result (`BatchWithdrawResult { stream_id, amount: 0 }`) and is skipped silently. No token transfer and no event are emitted for that entry. This allows callers to pass a mixed list of active and already-completed streams without pre-filtering.
 
 A `Paused` stream **does** panic and reverts the entire batch.
+### One-Shot Init and Immutable Bootstrap
+
+`init(token, admin)` has explicit externally observable bootstrap semantics:
+
+- One-shot: first successful call writes `Config { token, admin }` and `NextStreamId = 0`.
+- Auth boundary: the supplied `admin` address must authorize the call.
+- Re-init failure: any second call panics with `"already initialised"`.
+- Failure atomicity: failed auth or re-init leaves bootstrap storage unchanged.
+- Immutability boundary: `token` is immutable after init; `admin` can rotate only via `set_admin` with current-admin auth.
+
+Residual assumption: deployment flow must ensure the intended bootstrap admin signs the first init transaction.
+
+### create_streams: Batch Atomicity and Single Auth
+
+`create_streams(sender, streams)` is the batch creation entrypoint for treasury operators and indexers.
+
+- Single auth: only `sender` must authorize, and it is checked once for the entire batch.
+- Batch validation: every entry is validated before token transfer or persistence.
+- Atomic transfer: the contract pulls exactly `sum(deposit_amount)` once.
+- Atomic persistence: if any entry fails validation (or total-deposit sum overflows), no stream is created.
+- Event behavior: on success, one `created` event is emitted per created stream; on failure, no `created` events are emitted.
+- Ordering guarantee: returned stream IDs are contiguous and in the same order as input entries.
+
+Scope note: these guarantees are limited to `create_streams` creation semantics. They do not change withdrawal, pause/resume, cancellation, or cleanup rules.
 
 ---
 
@@ -289,15 +314,21 @@ Emitted when a recipient successfully withdraws tokens via `withdraw`.
 
 #### Other Events
 
-| Topic                      | Payload                                  | When Emitted                               |
-| -------------------------- | ---------------------------------------- | ------------------------------------------ |
-| `("created", stream_id)`   | `StreamCreated` (struct payload)         | `create_stream`                            |
-| `("paused", stream_id)`    | `StreamEvent::Paused(stream_id)`         | `pause_stream` / `pause_stream_as_admin`   |
-| `("resumed", stream_id)`   | `StreamEvent::Resumed(stream_id)`        | `resume_stream` / `resume_stream_as_admin` |
-| `("cancelled", stream_id)` | `StreamEvent::Cancelled(stream_id)`      | `cancel_stream` / `cancel_stream_as_admin` |
-| `("withdrew", stream_id)`  | `withdrawable` (i128)                    | `withdraw`                                 |
-| `("closed", stream_id)`    | `StreamEvent::StreamClosed(stream_id)`   | `close_completed_stream`                   |
-| `("top_up", stream_id)`    | `StreamToppedUp` (struct payload)        | `top_up_stream`                            |
+| Topic                      | Payload                                                                                      | When Emitted                                                                                 |
+| -------------------------- | -------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `("created", stream_id)`   | `StreamCreated` (struct payload)                                                             | `create_stream` / `create_streams`                                                           |
+| `("paused", stream_id)`    | `StreamEvent::Paused(stream_id)`                                                             | `pause_stream` / `pause_stream_as_admin`                                                     |
+| `("resumed", stream_id)`   | `StreamEvent::Resumed(stream_id)`                                                            | `resume_stream` / `resume_stream_as_admin`                                                   |
+| `("cancelled", stream_id)` | `StreamEvent::StreamCancelled(stream_id)`                                                    | `cancel_stream` / `cancel_stream_as_admin`                                                   |
+| `("withdrew", stream_id)`  | `Withdrawal { stream_id, recipient, amount }`                                                | `withdraw` / `batch_withdraw` — only when `amount > 0`                                       |
+| `("wdraw_to", stream_id)`  | `WithdrawalTo { stream_id, recipient, destination, amount }`                                 | `withdraw_to` — only when `amount > 0`. `recipient` is the authorizing caller; `destination` is where tokens were sent. |
+| `("completed", stream_id)` | `StreamEvent::StreamCompleted(stream_id)`                                                    | Emitted after `withdrew` or `wdraw_to` when `withdrawn_amount == deposit_amount`             |
+| `("closed", stream_id)`    | `StreamEvent::StreamClosed(stream_id)`                                                       | `close_completed_stream`                                                                     |
+| `("top_up", stream_id)`    | `StreamToppedUp { stream_id, top_up_amount, new_deposit_amount }`                            | `top_up_stream`                                                                              |
+| `("rate_upd", stream_id)`  | `RateUpdated { stream_id, old_rate_per_second, new_rate_per_second, effective_time }`        | `update_rate_per_second`                                                                     |
+| `("end_shrt", stream_id)`  | `StreamEndShortened { stream_id, old_end_time, new_end_time, refund_amount }`                | `shorten_stream_end_time`                                                                    |
+| `("end_ext", stream_id)`   | `StreamEndExtended { stream_id, old_end_time, new_end_time }`                                | `extend_stream_end_time`                                                                     |
+| `["AdminUpdated"]`         | `(old_admin: Address, new_admin: Address)`                                                   | `set_admin`                                                                                  |
 
 ---
 
@@ -311,13 +342,15 @@ errors relevant to stream creation and timing.
 | Message                                                                 | Function                                   | Trigger                      |
 | ----------------------------------------------------------------------- | ------------------------------------------ | ---------------------------- |
 | `"already initialised"`                                                 | `init`                                     | Re-init attempt              |
-| `"deposit_amount must be positive"`                                     | `create_stream`                            | deposit_amount <= 0          |
-| `"rate_per_second must be positive"`                                    | `create_stream`                            | rate_per_second <= 0         |
-| `"sender and recipient must be different"`                              | `create_stream`                            | sender == recipient          |
-| `"start_time must be before end_time"`                                  | `create_stream`                            | start_time >= end_time       |
-| `"cliff_time must be within [start_time, end_time]"`                    | `create_stream`                            | cliff out of range           |
-| `"deposit_amount must cover total streamable amount (rate * duration)"` | `create_stream`                            | underfunded                  |
-| `"overflow calculating total streamable amount"`                        | `create_stream`                            | overflow in rate \* duration |
+| authorization failure                                                   | `init`                                     | caller did not satisfy `admin.require_auth()` |
+| `"deposit_amount must be positive"`                                     | `create_stream` / `create_streams`         | deposit_amount <= 0          |
+| `"rate_per_second must be positive"`                                    | `create_stream` / `create_streams`         | rate_per_second <= 0         |
+| `"sender and recipient must be different"`                              | `create_stream` / `create_streams`         | sender == recipient          |
+| `"start_time must be before end_time"`                                  | `create_stream` / `create_streams`         | start_time >= end_time       |
+| `"cliff_time must be within [start_time, end_time]"`                    | `create_stream` / `create_streams`         | cliff out of range           |
+| `"deposit_amount must cover total streamable amount (rate * duration)"` | `create_stream` / `create_streams`         | underfunded                  |
+| `"overflow calculating total streamable amount"`                        | `create_stream` / `create_streams`         | overflow in rate \* duration |
+| `"overflow calculating total batch deposit"`                            | `create_streams`                           | overflow in sum of deposits  |
 | `ContractError::StartTimeInPast`                                        | `create_stream` / `create_streams`         | start_time < ledger timestamp |
 | `"stream not found"`                                                    | Various                                    | Invalid stream_id            |
 | `"stream is already paused"`                                            | `pause_stream`                             | Double pause                 |
@@ -328,6 +361,9 @@ errors relevant to stream creation and timing.
 | `"stream must be active or paused to cancel"`                           | `cancel_stream` / `cancel_stream_as_admin` | Cancel completed/cancelled   |
 | `"stream already completed"`                                            | `withdraw`                                 | Withdraw from completed (`batch_withdraw` silently returns 0 instead) |
 | `"cannot withdraw from paused stream"`                                  | `withdraw` / `batch_withdraw`              | Withdraw while paused        |
+| `"stream already completed"`                                            | `withdraw` / `withdraw_to`                 | Withdraw from completed      |
+| `"cannot withdraw from paused stream"`                                  | `withdraw` / `withdraw_to`                 | Withdraw while paused        |
+| `"destination must not be the contract"`                                | `withdraw_to`                              | destination == contract addr |
 | `"nothing to withdraw"`                                                 | `withdraw`                                 | accrued == withdrawn_amount  |
 | `"stream is not active"`                                                | `pause_stream_as_admin`                    | Admin pause non-active       |
 | `"stream is not paused"`                                                | `resume_stream_as_admin`                   | Admin resume non-paused      |
