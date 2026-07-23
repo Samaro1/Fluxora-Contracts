@@ -8,15 +8,20 @@ use crate::StreamKind;
 /// non-decreasing timestamps. This guard catches test harnesses, migrations, or
 /// future environments that violate that assumption before withdrawable math can
 /// be evaluated at a retrograde timestamp.
+///
+/// This check is unconditional (not gated behind debug_assertions) because it
+/// is a genuine runtime safetyGuard, not a debug-only sanity check. A retrograde
+/// ledger timestamp would flow straight into withdrawable-amount math with no
+/// safety net, which is exactly the fund-accounting-adjacent failure mode this
+/// guard was written to prevent.
+///
+/// # Units and Precision
+/// - **Units:** `prev_ts` and `current_ts` are measured in seconds.
+/// - **Rounding Direction:** N/A (this is purely a logical check, no arithmetic).
 pub fn assert_ledger_time_monotonic(prev_ts: u64, current_ts: u64) -> Result<(), ContractError> {
-    #[cfg(any(test, debug_assertions))]
-    {
-        if current_ts < prev_ts {
-            return Err(ContractError::ClockRegression);
-        }
+    if current_ts < prev_ts {
+        return Err(ContractError::ClockRegression);
     }
-
-    debug_assert!(current_ts >= prev_ts, "retrograde ledger timestamp");
 
     Ok(())
 }
@@ -32,6 +37,16 @@ pub fn assert_ledger_time_monotonic(prev_ts: u64, current_ts: u64) -> Result<(),
 /// - Multiplies elapsed seconds by `rate_per_second`, and on multiplication overflow
 ///   returns `deposit_amount` (safe upper bound before final clamping).
 /// - Final result is clamped to `[0, deposit_amount]`.
+///
+/// # Units and Precision
+/// - **Time units:** `start_time`, `cliff_time`, `end_time`, and `current_time` are in **seconds**.
+/// - **Amount units:** `deposit_amount` and the return value are in **base token units**.
+/// - **Rate units:** `rate_per_second` is in **base token units per second**.
+///
+/// # Rounding Direction
+/// Exact integer multiplication. No rounding occurs internally. Any effective rounding
+/// happened prior to this function if an external fractional rate was floored into an integer
+/// tokens-per-second rate. The calculation here is exact and non-fractional.
 ///
 /// For multi-epoch accrual (after rate changes), the contract uses the
 /// `calculate_accrued_amount_checkpointed` variant directly.
@@ -197,6 +212,22 @@ pub struct CheckpointState {
 /// 2. `accrued(checkpointed_at) == checkpointed_amount` — a rate decrease never reduces
 ///    the visible withdrawable amount.
 /// 3. `accrued(t) <= deposit_amount` for all `t`.
+///
+/// # Units and Precision
+/// - **Time units:** `now`, `cliff_time`, `end_time`, and `checkpointed_at` are in **seconds**.
+/// - **Amount units:** `deposit_amount`, `checkpointed_amount`, and the return value are in **base token units**.
+/// - **Rate units:** `rate_per_second` is in **base token units per second**.
+///
+/// # Rounding Direction and Math
+/// This function performs exact integer arithmetic. Since `rate_per_second` is an integer
+/// expressing the number of tokens accrued per full second, there are no fractional seconds
+/// and no fractional tokens computed.
+///
+/// The result of `elapsed_seconds * rate_per_second` is exact. Any precision loss occurs
+/// *before* this function, typically during stream creation when an external rate (e.g., tokens per month)
+/// is floored to integer tokens per second. Within this core math, the operation is exact integer
+/// multiplication, effectively rounding down (floor) any continuous time beyond the whole second boundaries,
+/// though time is already quantized in integer seconds.
 pub fn calculate_accrued_amount_checkpointed(
     state: CheckpointState,
     rate_per_second: i128,
@@ -419,6 +450,27 @@ mod tests {
     fn ledger_time_monotonic_u64_max_times() {
         let result = assert_ledger_time_monotonic(u64::MAX, u64::MAX);
         assert_eq!(result, Ok(()));
+    }
+
+    /// Test that the ClockRegression check is unconditional (not gated behind debug_assertions).
+    ///
+    /// This is a security-critical check that must always be active in production builds,
+    /// including release wasm32 deployments where debug_assertions is disabled by default.
+    /// A retrograde ledger timestamp would flow straight into withdrawable-amount math with
+    /// no safety net, which is exactly the fund-accounting-adjacent failure mode this guard
+    /// was written to prevent.
+    ///
+    /// This test locks in the always-on behavior independent of debug_assertions settings.
+    #[test]
+    fn clock_regression_check_is_unconditional() {
+        // This test should pass regardless of whether debug_assertions is enabled or not.
+        // The check is now unconditional (not gated behind cfg(any(test, debug_assertions))).
+        let result = assert_ledger_time_monotonic(1000, 999);
+        assert_eq!(
+            result,
+            Err(ContractError::ClockRegression),
+            "ClockRegression check must fire even when debug_assertions is disabled"
+        );
     }
 
     #[test]
