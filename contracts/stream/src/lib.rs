@@ -412,6 +412,8 @@ pub enum ContractError {
     WithdrawalTooFrequent = 33,
     /// Keeper attempted to close a stream before the grace period elapsed.
     KeeperGracePeriodNotElapsed = 34,
+    /// Withdraw dust threshold is negative or exceeds deposit amount.
+    InvalidDustThreshold = 35,
 }
 
 #[contracttype]
@@ -1060,9 +1062,10 @@ fn release_reentrancy_lock(env: &Env) {
 ///   short-lived streams below the static floor.
 fn compute_adaptive_ttl(now: u64, end_time: u64) -> u32 {
     let remaining_seconds = end_time.saturating_sub(now);
-    let ledgers_for_stream = (remaining_seconds / LEDGER_CLOSE_TIME) as u32;
-    let adaptive = ledgers_for_stream.saturating_add(BUFFER_LEDGERS);
-    adaptive.clamp(PERSISTENT_BUMP_AMOUNT, MAX_TTL)
+    let ledgers_for_stream = remaining_seconds / LEDGER_CLOSE_TIME;
+    let adaptive_u64 = ledgers_for_stream.saturating_add(BUFFER_LEDGERS as u64);
+    let clamped = adaptive_u64.clamp(PERSISTENT_BUMP_AMOUNT as u64, MAX_TTL as u64);
+    clamped as u32
 }
 
 fn get_config(env: &Env) -> Result<Config, ContractError> {
@@ -1669,6 +1672,14 @@ impl FluxoraStream {
             if m.len() as usize > MAX_MEMO_BYTES {
                 return Err(ContractError::InvalidParams);
             }
+        }
+
+        // Validate withdraw_dust_threshold: must be in range [0, deposit_amount]
+        if withdraw_dust_threshold < 0 {
+            return Err(ContractError::InvalidDustThreshold);
+        }
+        if withdraw_dust_threshold > deposit_amount {
+            return Err(ContractError::InvalidDustThreshold);
         }
 
         let stream_id = next_stream_id_for(env, &sender);
@@ -2833,11 +2844,13 @@ impl FluxoraStream {
         stream.recipient.require_auth();
 
         // Enforce withdrawal frequency limit to prevent excessive ledger I/O.
-        // Invariant: current_ledger >= last_withdraw_ledger (monotonic ledger progression).
+        // Use saturating_sub to prevent underflow from backward timestamp skew
+        // (if current_ledger < last_withdraw_ledger, elapsed=0, withdrawal blocked).
         // First withdrawal (last_withdraw_ledger == 0) always succeeds.
         let current_ledger = env.ledger().sequence();
         if stream.last_withdraw_ledger != 0
-            && current_ledger - stream.last_withdraw_ledger < MIN_WITHDRAW_INTERVAL_LEDGERS
+            && current_ledger.saturating_sub(stream.last_withdraw_ledger)
+                < MIN_WITHDRAW_INTERVAL_LEDGERS
         {
             return Err(ContractError::WithdrawalTooFrequent);
         }
@@ -2860,14 +2873,6 @@ impl FluxoraStream {
         withdrawable = withdrawable.min(contract_balance);
 
         if withdrawable <= 0 {
-            return Ok(0);
-        }
-
-        // Enforce dust threshold unless terminal state or final drain (#423)
-        if withdrawable < stream.withdraw_dust_threshold
-            && !is_terminal_state(&env, &stream)
-            && stream.withdrawn_amount + withdrawable < stream.deposit_amount
-        {
             return Ok(0);
         }
 
@@ -3255,9 +3260,10 @@ impl FluxoraStream {
             let current_ledger = env.ledger().sequence();
             // Enforce withdrawal frequency limit per stream in the batch.
             // Each stream must respect its own last_withdraw_ledger independently.
-            // Invariant: current_ledger >= last_withdraw_ledger (monotonic ledger progression).
+            // Use saturating_sub to prevent underflow from backward timestamp skew.
             if stream.last_withdraw_ledger != 0
-                && current_ledger - stream.last_withdraw_ledger < MIN_WITHDRAW_INTERVAL_LEDGERS
+                && current_ledger.saturating_sub(stream.last_withdraw_ledger)
+                    < MIN_WITHDRAW_INTERVAL_LEDGERS
             {
                 return Err(ContractError::WithdrawalTooFrequent);
             }
@@ -3548,28 +3554,22 @@ impl FluxoraStream {
         // replaced by the ed25519 signature check below.
         relayer.require_auth();
 
-        // 1. Deadline check — reject stale signatures before any storage reads.
-        if env.ledger().timestamp() > deadline {
-            return Err(ContractError::SignatureDeadlineExpired);
-        }
+        // 1. Validate delegation parameters (deadline & nonce against live state).
+        // delegation.rs backs delegated_withdraw authorization logic and queries live persistent storage on every call.
+        validate_delegation_params(&env, stream_id, nonce, deadline)?;
 
         // 2. Load stream.
         let mut stream = load_stream(&env, stream_id)?;
 
         // 3. Enforce withdrawal frequency limit to prevent excessive ledger I/O.
-        // Invariant: current_ledger >= last_withdraw_ledger (monotonic ledger progression).
+        // Use saturating_sub to prevent underflow from backward timestamp skew.
         // First withdrawal (last_withdraw_ledger == 0) always succeeds.
         let current_ledger = env.ledger().sequence();
         if stream.last_withdraw_ledger != 0
-            && current_ledger - stream.last_withdraw_ledger < MIN_WITHDRAW_INTERVAL_LEDGERS
+            && current_ledger.saturating_sub(stream.last_withdraw_ledger)
+                < MIN_WITHDRAW_INTERVAL_LEDGERS
         {
             return Err(ContractError::WithdrawalTooFrequent);
-        }
-
-        // 4. Nonce check — replay protection.
-        let stored_nonce = load_delegated_nonce(&env, &stream.recipient);
-        if nonce != stored_nonce {
-            return Err(ContractError::InvalidSignature);
         }
 
         // 5. Bind the supplied public key to the stream recipient.
@@ -5712,6 +5712,103 @@ impl FluxoraStream {
             (symbol_short!("resumed"), stream_id),
             StreamEvent::Resumed(stream_id),
         );
+        Ok(())
+    }
+
+    /// Atomically resume a batch of paused streams as the contract admin.
+    ///
+    /// Post-incident counterpart to per-stream [`Self::resume_stream_as_admin`]: after
+    /// [`Self::global_resume`] clears the emergency pause flag, operators (or governance)
+    /// may need to restore multiple streams that were admin-paused during the incident.
+    /// This entrypoint applies **atomic all-or-nothing** semantics — there is no
+    /// skip-and-report mode.
+    ///
+    /// # Two-phase execution
+    /// 1. **Validation phase**: Every `stream_id` is loaded and verified before any
+    ///    mutation:
+    ///    - Stream must exist (`StreamNotFound`).
+    ///    - Stream must be `Paused` (`StreamNotPaused` / `StreamTerminalState`).
+    ///    - Pause/resume cooldown must have elapsed (`PauseCooldownActive`).
+    ///    - Duplicate IDs are rejected (`DuplicateStreamId`).
+    /// 2. **Execution phase**: Only after all validations pass, each stream is set to
+    ///    `Active` and a `Resumed` event is emitted.
+    ///
+    /// # Authorization
+    /// - Requires authorization from the contract admin (same as `resume_stream_as_admin`).
+    ///
+    /// # Errors
+    /// - Any validation failure aborts the entire batch with **no** stream status
+    ///   changes and **no** `Resumed` events. Callers must remove or fix the offending
+    ///   ID (e.g. an already-cancelled stream) and retry.
+    ///
+    /// # Security
+    /// - Atomic: a mixed batch containing one non-resumable stream cannot leave the
+    ///   protocol in a partially-resumed state after an incident-response attempt.
+    /// - Admin auth is checked **before** validation, so a malformed batch cannot
+    ///   bypass governance / admin authorization.
+    pub fn bulk_resume_streams_as_admin(
+        env: Env,
+        stream_ids: soroban_sdk::Vec<u64>,
+    ) -> Result<(), ContractError> {
+        get_admin(&env)?.require_auth();
+
+        let n = stream_ids.len();
+        if n == 0 {
+            return Ok(());
+        }
+
+        let current_ledger = env.ledger().sequence();
+        let mut streams = soroban_sdk::Vec::<Stream>::new(&env);
+
+        // ── Phase 1: Validate all IDs (no mutations) ─────────────────────────
+        for i in 0..n {
+            let id = stream_ids.get(i).unwrap();
+
+            let mut j = i + 1;
+            while j < n {
+                if stream_ids.get(j).unwrap() == id {
+                    return Err(ContractError::DuplicateStreamId);
+                }
+                j += 1;
+            }
+
+            let stream = load_stream(&env, id)?;
+
+            if stream.status == StreamStatus::Active {
+                return Err(ContractError::StreamNotPaused);
+            }
+            if is_terminal_state(&env, &stream) {
+                return Err(ContractError::StreamTerminalState);
+            }
+            if stream.status != StreamStatus::Paused {
+                return Err(ContractError::StreamNotPaused);
+            }
+
+            let ledgers_since_last_toggle =
+                current_ledger.saturating_sub(stream.last_pause_toggle_ledger);
+            if ledgers_since_last_toggle < MIN_PAUSE_INTERVAL_LEDGERS {
+                return Err(ContractError::PauseCooldownActive);
+            }
+
+            streams.push_back(stream);
+        }
+
+        // ── Phase 2: Apply resumes ───────────────────────────────────────────
+        for i in 0..n {
+            let mut stream = streams.get(i).unwrap();
+            let stream_id = stream.stream_id;
+            let previous_status = stream.status;
+            stream.status = StreamStatus::Active;
+            stream.last_pause_toggle_ledger = current_ledger;
+            save_stream(&env, &stream);
+            reconcile_paused_stream_count(&env, previous_status, stream.status);
+
+            env.events().publish(
+                (symbol_short!("resumed"), stream_id),
+                StreamEvent::Resumed(stream_id),
+            );
+        }
+
         Ok(())
     }
 

@@ -220,6 +220,19 @@ jobs:
         run: cargo test --all --features testutils
         continue-on-error: true
 
+      # Hard gate: factory discriminant-stability test is testutils-free and
+      # must always pass. Guards docs/error.md FactoryError table against
+      # silent discriminant drift. See contracts/factory/tests/factory_error_discriminants.rs.
+      - name: Factory discriminant-stability tests
+        run: cargo test -p fluxora_factory
+
+      # Hard gate: cross-file collision audit. Parses all three discriminant
+      # tables in docs/error.md and fails (exit 1) on any intra-section
+      # collision (same code, different variant name, same enum).
+      # Cross-section overlaps are printed as warnings but do not fail CI.
+      - name: Cross-file discriminant-collision audit
+        run: python3 script/check-discriminant-collisions.py
+
 
       - name: Verify snapshot files exist
         run: |
@@ -279,6 +292,9 @@ jobs:
 
       - name: Generate coverage report
         run: |
+          # Default tarpaulin per-test timeout is 60s. Instrumented proptest
+          # suites in test_withdrawable_props exceed that and abort the job with
+          # "Timed out waiting for test response" (seen on PR coverage runs).
           cargo tarpaulin \
             --features testutils \
             --out Xml \
@@ -286,6 +302,7 @@ jobs:
             --output-dir coverage \
             --ignore-tests \
             --skip-clean \
+            --timeout 300 \
             -p fluxora_stream
 
       - name: Enforce 95% coverage gate
